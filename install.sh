@@ -186,6 +186,47 @@ check_busy_ports() {
   BUSY_PORTS="$(xargs <<<"$BUSY_PORTS")"
 }
 
+# next_free_port START [own_pid] -> first port >= START with no listener (except ours)
+next_free_port() {
+  local p="$1" own="${2:-0}" i
+  for ((i = 0; i < 200 && p <= 65535; i++, p++)); do
+    [[ "$p" == "22" ]] && continue
+    check_busy_ports "$p" "$own" >/dev/null
+    if [[ -z "$BUSY_PORTS" ]]; then
+      echo "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# True when PORT is listened on by the current MainPID of our unit (not some other service).
+port_owned_by_service() {
+  local pid
+  pid="$(service_pid)"
+  ((pid > 0)) || return 1
+  ss -lntpH "sport = :$1" 2>/dev/null | grep -q "pid=${pid},"
+}
+
+# wait_service_ports PORT... -> 0 when the unit is active and owns all ports (up to ~10s)
+wait_service_ports() {
+  local i p all
+  for ((i = 0; i < 10; i++)); do
+    sleep 1
+    systemctl is-active --quiet "$SERVICE_NAME" || continue
+    all=1
+    for p in "$@"; do port_owned_by_service "$p" || all=0; done
+    ((all)) && return 0
+  done
+  return 1
+}
+
+show_failure_logs() {
+  echo
+  echo "journalctl -u ${SERVICE_NAME} -n 20:"
+  journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null | sed 's/^/  /'
+}
+
 # Iran: drop ports that another service already listens on (x-ui, WaterWall, nginx ...).
 # Result in FREE_PORTS.
 FREE_PORTS=""
@@ -484,6 +525,17 @@ install_kharej() {
 
   own="$(service_pid)"
   tmp="${IN_SSH_PORT:-${SSH_PORT:-$DEFAULT_SSH_PORT}}"
+  validate_port "$tmp" || tmp="$DEFAULT_SSH_PORT"
+  check_busy_ports "$tmp" "$own" >/dev/null
+  if [[ -n "$BUSY_PORTS" ]]; then
+    [[ -n "$IN_SSH_PORT" && "$HAVE_TTY" != 1 ]] && err "SSH_PORT ${IN_SSH_PORT} is already in use: $(check_busy_ports "$tmp" "$own")"
+    local free
+    free="$(next_free_port "$tmp" "$own")" || err "No free port found near ${tmp}"
+    warn "Port ${tmp} is already in use (another sshd/tunnel?):"
+    check_busy_ports "$tmp" "$own"
+    msg "Suggesting free port ${free}"
+    tmp="$free"
+  fi
   while true; do
     ask SSH_PORT "Tunnel SSH port (NOT 22)" "$tmp"
     validate_port "$SSH_PORT" || err "Invalid port"
@@ -493,7 +545,7 @@ install_kharej() {
       warn "Port ${SSH_PORT} is already in use:"
       check_busy_ports "$SSH_PORT" "$own"
       [[ "$HAVE_TTY" == 1 ]] || err "SSH port ${SSH_PORT} busy"
-      tmp=""
+      tmp="$(next_free_port "$SSH_PORT" "$own" || true)"
       continue
     fi
     break
@@ -510,6 +562,7 @@ install_kharej() {
   done
   [[ -n "$none" ]] && warn "Nothing listens yet on: ${none}(tunnel will work once your panel/inbound listens there)"
 
+  SIDE="kharej"
   TUN_USER="$TUN_USER_DEFAULT"
   if [[ -f "$CLIENT_KEY" && "$HAVE_TTY" == 1 ]]; then
     if ! confirm "Keep existing keys (old connection code stays valid)?" Y; then
@@ -530,12 +583,17 @@ install_kharej() {
   systemctl daemon-reload
   systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
   systemctl restart "$SERVICE_NAME"
-  sleep 2
-  if systemctl is-active --quiet "$SERVICE_NAME"; then
-    ok "Kharej sshd is running on port ${SSH_PORT}"
+  if wait_service_ports "$SSH_PORT"; then
+    ok "Kharej sshd (${SERVICE_NAME}, pid $(service_pid)) is listening on port ${SSH_PORT}"
   else
-    journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null
-    err "Service failed to start"
+    show_failure_logs
+    echo "Listeners on ${SSH_PORT}:"
+    ss -lntpH "sport = :${SSH_PORT}" 2>/dev/null | sed 's/^/  /'
+    systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    err "${SERVICE_NAME} sshd is NOT listening on port ${SSH_PORT} (port busy or config error). Run again and pick another port."
+  fi
+  if ! load_env || [[ "$SIDE" != "kharej" ]]; then
+    err "State file ${CONF_ENV} was not written correctly"
   fi
   echo "  Cloud firewall / security group: allow TCP ${SSH_PORT} inbound."
   show_code
@@ -621,22 +679,19 @@ EOF
 
 verify_iran() {
   local p up="" down=""
-  sleep 3
-  if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-    journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null
-    warn "Tunnel is not running yet (it keeps retrying). Check: sshtun -> Status / Logs"
-    return 1
+  # shellcheck disable=SC2086
+  if wait_service_ports $PORTS; then
+    ok "Tunnel up (pid $(service_pid)), listening on 0.0.0.0: ${PORTS}"
+    return 0
   fi
   for p in $PORTS; do
-    if ss -lntpH "sport = :$p" 2>/dev/null | grep -q '"ssh"'; then up+="$p "; else down+="$p "; fi
+    if port_owned_by_service "$p"; then up+="$p "; else down+="$p "; fi
   done
-  [[ -n "$up" ]] && ok "Listening on 0.0.0.0: ${up}"
-  if [[ -n "$down" ]]; then
-    warn "Not listening yet: ${down}"
-    journalctl -u "$SERVICE_NAME" -n 10 --no-pager 2>/dev/null
-    return 1
-  fi
-  return 0
+  [[ -n "$up" ]] && ok "Listening: ${up}"
+  echo -e "${RED}ERR${NC} Tunnel is NOT up yet${down:+ (not listening: ${down})}. The service keeps retrying."
+  echo "  Check Kharej IP/port reachability, cloud firewall, and the code. Menu: sshtun -> Status / Logs"
+  show_failure_logs
+  return 1
 }
 
 install_iran() {
@@ -749,7 +804,12 @@ show_status() {
   fi
   if [[ "$SIDE" == "kharej" ]]; then
     n="$(ss -tnH state established "sport = :${SSH_PORT}" 2>/dev/null | wc -l)"
-    echo "  listen   : 0.0.0.0:${SSH_PORT}  (connected clients: ${n})"
+    if port_owned_by_service "$SSH_PORT"; then
+      echo -e "  listen   : 0.0.0.0:${SSH_PORT} ${GRN}(our sshd)${NC}  connected clients: ${n}"
+    else
+      echo -e "  listen   : ${RED}0.0.0.0:${SSH_PORT} NOT held by ${SERVICE_NAME}${NC}"
+      ss -lntpH "sport = :${SSH_PORT}" 2>/dev/null | sed 's/^/    other: /'
+    fi
     echo "  user     : ${TUN_USER}"
     echo "  allowed  : ${PORTS}"
     for p in $PORTS; do
@@ -760,7 +820,7 @@ show_status() {
     echo "  kharej   : ${KHAREJ_IP}:${SSH_PORT} (user ${TUN_USER})"
     echo "  cipher   : ${CIPHERS}"
     for p in $PORTS; do
-      if ss -lntpH "sport = :$p" 2>/dev/null | grep -q '"ssh"'; then
+      if port_owned_by_service "$p"; then
         echo -e "    0.0.0.0:${p}  ${GRN}listening${NC}"
       else
         echo -e "    0.0.0.0:${p}  ${RED}down${NC}"
@@ -798,11 +858,11 @@ change_ports() {
     write_kharej_access
     write_env
     systemctl restart "$SERVICE_NAME"
-    sleep 1
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
+    if wait_service_ports "$SSH_PORT"; then
       ok "Allowed ports: ${PORTS}"
     else
-      warn "Service not active — check logs"
+      show_failure_logs
+      warn "${SERVICE_NAME} sshd is not listening on ${SSH_PORT}"
     fi
     echo "  Then on Iran: sshtun -> Edit ports (the old code still works; new code below includes new ports)."
     show_code
@@ -904,8 +964,8 @@ main() {
     logs) show_logs ;;
     code) show_code ;;
     uninstall|remove) uninstall_all ;;
-    fw-add) load_env && fw_add ;;
-    fw-del) load_env && fw_del ;;
+    fw-add) load_env && fw_add; exit 0 ;;
+    fw-del) load_env && fw_del; exit 0 ;;
     *)
       if [[ "$HAVE_TTY" == 1 ]]; then
         menu
